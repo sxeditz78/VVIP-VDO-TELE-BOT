@@ -172,14 +172,24 @@ async def is_expired(user_id: int) -> bool:
     return datetime.utcnow() > row["expires_at"]
 
 async def approve_user(user_id: int):
-    expires = datetime.utcnow() + timedelta(days=APPROVAL_DAYS)
     async with pool.acquire() as conn:
+        # Check karo existing expiry
+        row = await conn.fetchrow("SELECT expires_at FROM users WHERE user_id = $1", user_id)
+        existing_expiry = row["expires_at"] if row else None
+
+        # Agar expiry abhi baaki hai toh naya time mat do
+        if existing_expiry and existing_expiry > datetime.utcnow():
+            expires = existing_expiry
+        else:
+            expires = datetime.utcnow() + timedelta(days=APPROVAL_DAYS)
+
         await conn.execute("""
             UPDATE users SET is_approved = TRUE, is_rejected = FALSE,
             approved_at = NOW(), expires_at = $2 WHERE user_id = $1
         """, user_id, expires)
         # ✅ Ban bhi hatao automatically
         await conn.execute("DELETE FROM banned_users WHERE user_id = $1", user_id)
+    return expires
 
 async def reject_user(user_id: int):
     async with pool.acquire() as conn:
@@ -384,11 +394,10 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         target_id = int(data.split("_")[1])
         if data.startswith("approve_"):
-            await approve_user(target_id)
-            expires = datetime.utcnow() + timedelta(days=APPROVAL_DAYS)
-            await query.edit_message_text(query.message.text + f"\n\n✅ *Approved — 28 din ka access diya gaya.*\n📅 Expires: {expires.strftime('%d %b %Y')}", parse_mode="Markdown")
+            expires = await approve_user(target_id)
+            await query.edit_message_text(query.message.text + f"\n\n✅ *Approved!*\n📅 Expires: {expires.strftime('%d %b %Y')}", parse_mode="Markdown")
             try:
-                await ctx.bot.send_message(target_id, f"🎉 *Aapki request approve ho gayi!*\n\n⏳ Aapko *28 din* ka access mila hai.\n📅 Expiry: *{expires.strftime('%d %b %Y')}*\n\n/start dabao aur enjoy karo 🚀", parse_mode="Markdown")
+                await ctx.bot.send_message(target_id, f"🎉 *Aapka access restore ho gaya!*\n\n📅 Expiry: *{expires.strftime('%d %b %Y')}*\n\n/start dabao aur enjoy karo 🚀", parse_mode="Markdown")
             except TelegramError:
                 pass
         elif data.startswith("reject_"):
@@ -550,13 +559,10 @@ async def approve_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Valid User ID daalo.")
         return
-    if await is_banned(target_id):
-        await unban_user(target_id)
-    await approve_user(target_id)
-    expires = datetime.utcnow() + timedelta(days=APPROVAL_DAYS)
+    expires = await approve_user(target_id)
     await update.message.reply_text(f"✅ User `{target_id}` approve ho gaya!\n📅 Expiry: *{expires.strftime('%d %b %Y')}*", parse_mode="Markdown")
     try:
-        await ctx.bot.send_message(target_id, f"🎉 *Aapki request approve ho gayi!*\n\n⏳ Aapko *28 din* ka access mila hai.\n📅 Expiry: *{expires.strftime('%d %b %Y')}*\n\n/start dabao aur enjoy karo 🚀", parse_mode="Markdown")
+        await ctx.bot.send_message(target_id, f"🎉 *Aapka access restore ho gaya!*\n\n📅 Expiry: *{expires.strftime('%d %b %Y')}*\n\n/start dabao aur enjoy karo 🚀", parse_mode="Markdown")
     except TelegramError:
         pass
 
