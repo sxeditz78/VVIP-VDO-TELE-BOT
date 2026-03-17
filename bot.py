@@ -298,15 +298,16 @@ async def check_ban(update: Update, ctx=None) -> bool:
             await update.message.reply_text(msg_text, parse_mode="Markdown")
         elif update.callback_query:
             await update.callback_query.answer("💎 Premium expire! Admin se contact karein.", show_alert=True)
-        if ctx and expired:
+        # ✅ Har banned user ke liye admin ko notify karo
+        if ctx:
             try:
                 await ctx.bot.send_message(
                     chat_id=ADMIN_ID,
                     text=(
-                        f"🔄 *Renewal Request!*\n\n"
+                        f"🔄 *Access Request!*\n\n"
                         f"👤 Name: *{username}*\n"
                         f"🆔 User ID: `{user_id}`\n\n"
-                        f"Renew karne ke liye:\n"
+                        f"Access dene ke liye:\n"
                         f"`/approve {user_id}`"
                     ),
                     parse_mode="Markdown"
