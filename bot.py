@@ -35,7 +35,7 @@ BUY_PREMIUM_MSG = (
     "🚫 Aapke *28 din* poore ho gaye hain.\n\n"
     "🔓 *Premium Access Kaise Lein?*\n"
     "👉 Admin se sampark karein aur apna subscription renew karein.\n\n"
-    f"📩 Admin: {@SynaX_69}\n"
+    f"📩 Admin: @SynaX_69\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "✨ _Premium members ko unlimited access milta hai!_"
 )
@@ -413,7 +413,8 @@ async def send_media_to_user(
             from_chat_id=SOURCE_CHAT_ID,
             message_id=media["message_id"],
             caption="⏱️ 10 min mein delete ho jayega",
-            reply_markup=keyboard
+            reply_markup=keyboard,
+            
         )
 
         asyncio.create_task(
