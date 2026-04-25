@@ -5,7 +5,8 @@ import logging
 from datetime import datetime, timedelta
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot,
+    BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -15,23 +16,25 @@ from telegram.error import TelegramError
 
 import asyncpg
 
+# ─── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN        = os.environ["BOT_TOKEN"]
 DATABASE_URL     = os.environ["DATABASE_URL"]
 SOURCE_CHAT_ID   = int(os.environ["SOURCE_CHAT_ID"])
 ADMIN_ID         = int(os.environ["ADMIN_ID"])
 ADMIN_USERNAME   = os.environ.get("ADMIN_USERNAME", "@SynaX_69")
+SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "@SynaX_69")   # support button username
 
 AUTO_DELETE_SECONDS = 600
-REPEAT_CHANCE       = 0.10
+REPEAT_CHANCE       = 0.02   # 2% repeat chance
 APPROVAL_DAYS       = 28
 
 BUY_PREMIUM_MSG = (
     "💎 *Aapki Premium Access Expire Ho Gayi!*\n\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "🚫 Aapke *28 din* poore ho gaye hain.\n\n"
+    f"🚫 Aapke *{APPROVAL_DAYS} din* poore ho gaye hain.\n\n"
     "🔓 *Premium Access Kaise Lein?*\n"
     "👉 Admin se sampark karein aur apna subscription renew karein.\n\n"
-    "📩 Admin: @SynaX_69\n"
+    f"📩 Admin: {ADMIN_USERNAME}\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "✨ _Premium members ko unlimited access milta hai!_"
 )
@@ -41,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 pool: asyncpg.Pool = None
 
+# ─── DB Init ───────────────────────────────────────────────────────────────────
 async def init_db():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, ssl="prefer")
@@ -96,12 +100,43 @@ async def init_db():
                 reason      TEXT DEFAULT 'No reason given'
             )
         """)
+        # Track 2-day expiry warnings (so we don't spam)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS expiry_notified (
+                user_id     BIGINT PRIMARY KEY,
+                notified_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
     logger.info("✅ Database initialized")
 
 
+# ─── Bot Commands Menu ─────────────────────────────────────────────────────────
+async def set_bot_commands(bot: Bot):
+    user_commands = [
+        BotCommand("start",  "▶️ Bot shuru karo / media dekho"),
+        BotCommand("status", "📅 Apni expiry date dekho"),
+    ]
+    admin_commands = user_commands + [
+        BotCommand("stats",     "📊 Bot statistics"),
+        BotCommand("pending",   "⏳ Pending approval requests"),
+        BotCommand("approve",   "✅ User approve karo"),
+        BotCommand("reject",    "❌ User reject karo"),
+        BotCommand("ban",       "🚫 User ban karo"),
+        BotCommand("unban",     "🔓 User unban karo"),
+        BotCommand("banned",    "📋 Banned users list"),
+        BotCommand("expiring",  "⚠️ Expiring users (3 din mein)"),
+        BotCommand("broadcast", "📢 Sabko message bhejo"),
+    ]
+    await bot.set_my_commands(user_commands, scope=BotCommandScopeAllPrivateChats())
+    await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    logger.info("✅ Bot commands menu set")
+
+
+# ─── Expiry Checker (runs hourly) ──────────────────────────────────────────────
 async def expiry_checker(bot: Bot):
     while True:
         try:
+            # 1) Auto-ban fully expired users
             async with pool.acquire() as conn:
                 expired_users = await conn.fetch("""
                     SELECT u.user_id FROM users u
@@ -112,7 +147,7 @@ async def expiry_checker(bot: Bot):
                 """)
             for row in expired_users:
                 uid = row["user_id"]
-                await ban_user(uid, reason="28-day premium expired")
+                await ban_user(uid, reason=f"{APPROVAL_DAYS}-day premium expired")
                 async with pool.acquire() as conn:
                     await conn.execute("UPDATE users SET is_approved = FALSE WHERE user_id = $1", uid)
                 try:
@@ -120,11 +155,48 @@ async def expiry_checker(bot: Bot):
                 except TelegramError:
                     pass
                 logger.info(f"⏰ Auto-banned expired user: {uid}")
+
+            # 2) Send 2-day warning (only once per cycle)
+            soon = datetime.utcnow() + timedelta(days=2)
+            async with pool.acquire() as conn:
+                warning_users = await conn.fetch("""
+                    SELECT u.user_id, u.expires_at FROM users u
+                    WHERE u.is_approved = TRUE
+                      AND u.expires_at IS NOT NULL
+                      AND u.expires_at BETWEEN NOW() AND $1
+                      AND u.user_id NOT IN (SELECT user_id FROM banned_users)
+                      AND u.user_id NOT IN (SELECT user_id FROM expiry_notified)
+                """, soon)
+            for row in warning_users:
+                uid        = row["user_id"]
+                expires_at = row["expires_at"]
+                exp_str    = expires_at.strftime('%d %b %Y')
+                msg = (
+                    f"⚠️ *Premium Expire Hone Wala Hai!*\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📅 Aapka premium *{exp_str}* ko expire ho jayega.\n\n"
+                    f"🔓 Ab hi renew karo — admin se sampark karo:\n"
+                    f"📩 {ADMIN_USERNAME}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"✨ _Access khatam hone se pehle renew karo!_"
+                )
+                try:
+                    await bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown")
+                    async with pool.acquire() as conn:
+                        await conn.execute("""
+                            INSERT INTO expiry_notified (user_id) VALUES ($1)
+                            ON CONFLICT (user_id) DO UPDATE SET notified_at = NOW()
+                        """, uid)
+                    logger.info(f"📬 Expiry warning sent to: {uid}")
+                except TelegramError:
+                    pass
+
         except Exception as e:
             logger.error(f"Expiry checker error: {e}")
         await asyncio.sleep(3600)
 
 
+# ─── Helpers ───────────────────────────────────────────────────────────────────
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
@@ -173,22 +245,18 @@ async def is_expired(user_id: int) -> bool:
 
 async def approve_user(user_id: int):
     async with pool.acquire() as conn:
-        # Check karo existing expiry
         row = await conn.fetchrow("SELECT expires_at FROM users WHERE user_id = $1", user_id)
         existing_expiry = row["expires_at"] if row else None
-
-        # Agar expiry abhi baaki hai toh naya time mat do
         if existing_expiry and existing_expiry > datetime.utcnow():
             expires = existing_expiry
         else:
             expires = datetime.utcnow() + timedelta(days=APPROVAL_DAYS)
-
         await conn.execute("""
             UPDATE users SET is_approved = TRUE, is_rejected = FALSE,
             approved_at = NOW(), expires_at = $2 WHERE user_id = $1
         """, user_id, expires)
-        # ✅ Ban bhi hatao automatically
         await conn.execute("DELETE FROM banned_users WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM expiry_notified WHERE user_id = $1", user_id)
     return expires
 
 async def reject_user(user_id: int):
@@ -197,16 +265,20 @@ async def reject_user(user_id: int):
 
 def approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve (28 Days)", callback_data=f"approve_{user_id}"),
-        InlineKeyboardButton("❌ Reject",            callback_data=f"reject_{user_id}"),
+        InlineKeyboardButton(f"✅ Approve ({APPROVAL_DAYS} Days)", callback_data=f"approve_{user_id}"),
+        InlineKeyboardButton("❌ Reject",                          callback_data=f"reject_{user_id}"),
+    ]])
+
+def ban_request_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve (Continue Sub)", callback_data=f"approve_{user_id}"),
+        InlineKeyboardButton("🚫 Keep Banned",            callback_data=f"keepban_{user_id}"),
     ]])
 
 async def get_stats() -> dict:
     async with pool.acquire() as conn:
-        total       = await conn.fetchval("SELECT COUNT(*) FROM users")
-        live_cutoff = datetime.utcnow() - timedelta(minutes=5)
-        live        = await conn.fetchval("SELECT COUNT(*) FROM users WHERE last_seen >= $1", live_cutoff)
-    return {"total": total or 0, "live": live or 0}
+        total = await conn.fetchval("SELECT COUNT(*) FROM users")
+    return {"total": total or 0}
 
 async def update_last_seen(user_id: int):
     async with pool.acquire() as conn:
@@ -267,8 +339,16 @@ async def get_prev_media(user_id: int, current_media_id: int) -> dict | None:
 
 def media_keyboard(stats: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Previous", callback_data="prev"), InlineKeyboardButton("▶️ Next", callback_data="next")],
-        [InlineKeyboardButton(f"🟢 Live: {stats['live']}", callback_data="noop"), InlineKeyboardButton(f"👥 Joined: {stats['total']}", callback_data="noop")]
+        [
+            InlineKeyboardButton("⬅️ Previous", callback_data="prev"),
+            InlineKeyboardButton("▶️ Next",     callback_data="next"),
+        ],
+        [
+            InlineKeyboardButton(f"👥 Total Joined: {stats['total']}", callback_data="noop"),
+        ],
+        [
+            InlineKeyboardButton("🆘 Support", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}"),
+        ],
     ])
 
 async def send_media_to_user(bot: Bot, chat_id: int, media: dict, stats: dict, old_msg_id: int | None = None) -> int | None:
@@ -285,7 +365,6 @@ async def send_media_to_user(bot: Bot, chat_id: int, media: dict, stats: dict, o
             message_id=media["message_id"],
             caption="⏱️ 10 min mein delete ho jayega",
             reply_markup=keyboard,
-            
         )
         asyncio.create_task(auto_delete(bot, chat_id, msg.message_id, AUTO_DELETE_SECONDS))
         return msg.message_id
@@ -300,6 +379,8 @@ async def auto_delete(bot: Bot, chat_id: int, message_id: int, delay: int):
     except TelegramError:
         pass
 
+
+# ─── Ban Check ─────────────────────────────────────────────────────────────────
 async def check_ban(update: Update, ctx=None) -> bool:
     user_id  = update.effective_user.id
     username = update.effective_user.full_name or "Unknown"
@@ -310,25 +391,27 @@ async def check_ban(update: Update, ctx=None) -> bool:
             await update.message.reply_text(msg_text, parse_mode="Markdown")
         elif update.callback_query:
             await update.callback_query.answer("💎 Premium expire! Admin se contact karein.", show_alert=True)
-        # ✅ Har banned user ke liye admin ko notify karo with buttons
+        # Notify admin with Approve / Keep Banned buttons
         if ctx:
             try:
                 await ctx.bot.send_message(
                     chat_id=ADMIN_ID,
                     text=(
-                        f"🔄 *Access Request!*\n\n"
+                        f"🔄 *Banned User Ne /start Kiya!*\n\n"
                         f"👤 Name: *{username}*\n"
                         f"🆔 User ID: `{user_id}`\n\n"
-                        f"Access dena hai?"
+                        f"Subscription continue karna hai?"
                     ),
                     parse_mode="Markdown",
-                    reply_markup=approval_keyboard(user_id)
+                    reply_markup=ban_request_keyboard(user_id),
                 )
             except TelegramError:
                 pass
         return True
     return False
 
+
+# ─── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id  = update.effective_user.id
     username = update.effective_user.full_name or "Unknown"
@@ -340,32 +423,39 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ *Aapki request reject ho gayi hai.*\n\nAdmin se contact karein.", parse_mode="Markdown")
         return
     if not await is_approved(user_id):
-        await update.message.reply_text("⏳ *Aapki request admin ke paas bhej di gayi hai.*\n\nApprove hone ke baad aap bot use kar sakte ho. Thoda wait karo! 🙏", parse_mode="Markdown")
+        await update.message.reply_text(
+            "⏳ *Aapki request admin ke paas bhej di gayi hai.*\n\nApprove hone ke baad aap bot use kar sakte ho. Thoda wait karo! 🙏",
+            parse_mode="Markdown"
+        )
         try:
             await ctx.bot.send_message(
                 chat_id=ADMIN_ID,
-                text=f"🔔 *Naya User Request!*\n\n👤 Name: *{username}*\n🆔 User ID: `{user_id}`\n\nApprove (28 Days) ya Reject karo:",
+                text=f"🔔 *Naya User Request!*\n\n👤 Name: *{username}*\n🆔 User ID: `{user_id}`\n\nApprove ({APPROVAL_DAYS} Days) ya Reject karo:",
                 parse_mode="Markdown",
-                reply_markup=approval_keyboard(user_id)
+                reply_markup=approval_keyboard(user_id),
             )
         except TelegramError as e:
             logger.error(f"Admin notify error: {e}")
         return
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT expires_at FROM users WHERE user_id = $1", user_id)
-    stats     = await get_stats()
-    pos       = await get_position(user_id)
+    stats      = await get_stats()
+    pos        = await get_position(user_id)
     expires_at = row["expires_at"] if row else None
     days_left  = None
     if expires_at:
         delta     = expires_at - datetime.utcnow()
         days_left = max(0, delta.days)
-    expiry_line = f"⏳ Access: *{days_left} din baaki*\n" if days_left is not None else ""
+    exp_date_str = expires_at.strftime('%d %b %Y') if expires_at else "N/A"
+    expiry_line  = f"📅 Expiry: *{exp_date_str}* ({days_left} din baaki)\n" if days_left is not None else ""
+
     if pos:
-        welcome = f"👋 *Wapas aaye!*\n\n🟢 Live: *{stats['live']}* | 👥 Joined: *{stats['total']}*\n{expiry_line}\nWohi se shuru kar rahe hain jahan chhoda tha ⬇️"
+        welcome = f"👋 *Wapas aaye!*\n\n👥 Total Joined: *{stats['total']}*\n{expiry_line}\nWohi se shuru kar rahe hain jahan chhoda tha ⬇️"
     else:
-        welcome = f"🎉 *Welcome!*\n\n🟢 Live: *{stats['live']}* | 👥 Joined: *{stats['total']}*\n{expiry_line}\n▶️ Next dabao aur enjoy karo!"
+        welcome = f"🎉 *Welcome!*\n\n👥 Total Joined: *{stats['total']}*\n{expiry_line}\n▶️ Next dabao aur enjoy karo!"
     await update.message.reply_text(welcome, parse_mode="Markdown")
+
     if pos and pos.get("current_media_id"):
         async with pool.acquire() as conn:
             media = await conn.fetchrow("SELECT id, message_id, media_type FROM media WHERE id = $1", pos["current_media_id"])
@@ -374,6 +464,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if new_msg_id:
                 await save_position(user_id, media["id"], new_msg_id)
             return
+
     media = await get_next_media(user_id)
     if not media:
         await update.message.reply_text("⚠️ Abhi koi media available nahi hai.")
@@ -383,21 +474,60 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await mark_seen(user_id, media["id"])
         await save_position(user_id, media["id"], new_msg_id)
 
+
+# ─── /status ───────────────────────────────────────────────────────────────────
+async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if await is_banned(user_id):
+        await update.message.reply_text(BUY_PREMIUM_MSG, parse_mode="Markdown")
+        return
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT is_approved, expires_at FROM users WHERE user_id = $1", user_id)
+    if not row or not row["is_approved"]:
+        await update.message.reply_text("⏳ *Aapka account approved nahi hai abhi.*", parse_mode="Markdown")
+        return
+    expires_at = row["expires_at"]
+    if expires_at:
+        delta     = expires_at - datetime.utcnow()
+        days_left = max(0, delta.days)
+        exp_str   = expires_at.strftime('%d %b %Y')
+        text = (
+            f"📊 *Aapka Premium Status*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Status: *Active*\n"
+            f"📅 Expiry Date: *{exp_str}*\n"
+            f"⏳ Baaki Din: *{days_left} din*\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+    else:
+        text = "✅ *Aapka account approved hai.*\n📅 Expiry: N/A"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ─── Button Handler ────────────────────────────────────────────────────────────
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     data    = query.data
-    if data.startswith("approve_") or data.startswith("reject_"):
+
+    if data.startswith("approve_") or data.startswith("reject_") or data.startswith("keepban_"):
         if user_id != ADMIN_ID:
             await query.answer("🚫 Sirf admin ke liye!", show_alert=True)
             return
-        target_id = int(data.split("_")[1])
+        target_id = int(data.split("_", 1)[1])
         if data.startswith("approve_"):
             expires = await approve_user(target_id)
-            await query.edit_message_text(query.message.text + f"\n\n✅ *Approved!*\n📅 Expires: {expires.strftime('%d %b %Y')}", parse_mode="Markdown")
+            await query.edit_message_text(
+                query.message.text + f"\n\n✅ *Approved!*\n📅 Expires: {expires.strftime('%d %b %Y')}",
+                parse_mode="Markdown"
+            )
             try:
-                await ctx.bot.send_message(target_id, f"🎉 *Aapka access restore ho gaya!*\n\n📅 Expiry: *{expires.strftime('%d %b %Y')}*\n\n/start dabao aur enjoy karo 🚀", parse_mode="Markdown")
+                await ctx.bot.send_message(
+                    target_id,
+                    f"🎉 *Aapka access restore ho gaya!*\n\n📅 Expiry: *{expires.strftime('%d %b %Y')}*\n\n/start dabao aur enjoy karo 🚀",
+                    parse_mode="Markdown"
+                )
             except TelegramError:
                 pass
         elif data.startswith("reject_"):
@@ -407,7 +537,10 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await ctx.bot.send_message(target_id, "❌ *Aapki request reject ho gayi hai.*\n\nZyada jaankari ke liye admin se sampark karein.", parse_mode="Markdown")
             except TelegramError:
                 pass
+        elif data.startswith("keepban_"):
+            await query.edit_message_text(query.message.text + "\n\n🚫 *Ban kept. No action taken.*", parse_mode="Markdown")
         return
+
     if data == "noop":
         return
     if await check_ban(update):
@@ -415,10 +548,12 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await is_approved(user_id):
         await query.answer("⏳ Aapki request abhi pending hai!", show_alert=True)
         return
+
     await update_last_seen(user_id)
     stats            = await get_stats()
     pos              = await get_position(user_id)
     current_media_id = pos["current_media_id"] if pos else None
+
     if data == "next":
         media = await get_next_media(user_id)
         if not media:
@@ -434,11 +569,16 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.answer("⚠️ Ye pehli media hai!", show_alert=True)
             return
         media = {"id": prev["media_id"], "message_id": prev["message_id"], "media_type": prev["media_type"]}
+    else:
+        return
+
     old_msg_id = pos["bot_message_id"] if pos else None
     new_msg_id = await send_media_to_user(ctx.bot, user_id, media, stats, old_msg_id=old_msg_id)
     if new_msg_id:
         await save_position(user_id, media["id"], new_msg_id)
 
+
+# ─── Media Watcher ─────────────────────────────────────────────────────────────
 async def watcher(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg:
@@ -451,43 +591,101 @@ async def watcher(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not media_type:
         return
     async with pool.acquire() as conn:
-        await conn.execute("INSERT INTO media (message_id, media_type) VALUES ($1, $2) ON CONFLICT (message_id) DO NOTHING", msg.message_id, media_type)
+        await conn.execute(
+            "INSERT INTO media (message_id, media_type) VALUES ($1, $2) ON CONFLICT (message_id) DO NOTHING",
+            msg.message_id, media_type
+        )
     logger.info(f"📥 New {media_type} saved — msg_id={msg.message_id}")
 
-async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update_last_seen(update.effective_user.id)
-    stats = await get_stats()
-    async with pool.acquire() as conn:
-        media_count    = await conn.fetchval("SELECT COUNT(*) FROM media")
-        approved_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_approved = TRUE")
-        banned_count   = await conn.fetchval("SELECT COUNT(*) FROM banned_users")
-        expired_count  = await conn.fetchval("SELECT COUNT(*) FROM users WHERE expires_at IS NOT NULL AND expires_at < NOW()")
-    text = (f"📊 *Bot Stats*\n\n🟢 Live users (last 5 min): *{stats['live']}*\n👥 Total joined: *{stats['total']}*\n✅ Approved users: *{approved_count}*\n🚫 Banned users: *{banned_count}*\n⏰ Expired users: *{expired_count}*\n🎬 Total media in DB: *{media_count}*")
-    await update.message.reply_text(text, parse_mode="Markdown")
 
-async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ─── Admin: /stats ─────────────────────────────────────────────────────────────
+async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Sirf admin use kar sakta hai.")
         return
-    if not ctx.args:
-        await update.message.reply_text("ℹ️ Usage: `/broadcast Aapka message yahan`", parse_mode="Markdown")
+    await update_last_seen(update.effective_user.id)
+    async with pool.acquire() as conn:
+        total_users    = await conn.fetchval("SELECT COUNT(*) FROM users")
+        approved_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_approved = TRUE")
+        banned_count   = await conn.fetchval("SELECT COUNT(*) FROM banned_users")
+        media_count    = await conn.fetchval("SELECT COUNT(*) FROM media")
+        pending_count  = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_approved = FALSE AND is_rejected = FALSE")
+    text = (
+        f"📊 *Bot Statistics*\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Total Joined: *{total_users}*\n"
+        f"✅ Approved Users: *{approved_count}*\n"
+        f"⏳ Pending Requests: *{pending_count}*\n"
+        f"🚫 Banned Users: *{banned_count}*\n"
+        f"🎬 Total Media in DB: *{media_count}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ─── Admin: /broadcast ─────────────────────────────────────────────────────────
+async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Text only:    /broadcast Your message here
+    Image+caption: Reply to a photo → /broadcast Your caption (links work)
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Sirf admin use kar sakta hai.")
         return
-    message_text = " ".join(ctx.args)
+
+    caption_text = " ".join(ctx.args) if ctx.args else None
+    replied_msg  = update.message.reply_to_message
+    photo_file_id = None
+
+    if replied_msg and replied_msg.photo:
+        photo_file_id = replied_msg.photo[-1].file_id
+        if not caption_text:
+            caption_text = replied_msg.caption or ""
+    elif not caption_text:
+        await update.message.reply_text(
+            "ℹ️ *Broadcast Usage:*\n\n"
+            "📝 *Text only:*\n`/broadcast Aapka message yahan`\n\n"
+            "🖼️ *Image + Caption:*\nEk photo forward karo is chat mein, usse reply karo:\n`/broadcast Aapka caption yahan`\n\n"
+            "🔗 Links caption mein directly likho.",
+            parse_mode="Markdown"
+        )
+        return
+
     users = await get_all_active_users()
     if not users:
         await update.message.reply_text("⚠️ Koi active user nahi hai.")
         return
+
     status_msg = await update.message.reply_text(f"📤 Broadcasting to *{len(users)}* users...", parse_mode="Markdown")
     success, failed = 0, 0
+
     for uid in users:
         try:
-            await ctx.bot.send_message(chat_id=uid, text=f"📢 *Admin Message:*\n\n{message_text}", parse_mode="Markdown")
+            if photo_file_id:
+                await ctx.bot.send_photo(
+                    chat_id=uid,
+                    photo=photo_file_id,
+                    caption=f"📢 *Admin Message:*\n\n{caption_text}" if caption_text else "📢 *Admin Message*",
+                    parse_mode="Markdown",
+                )
+            else:
+                await ctx.bot.send_message(
+                    chat_id=uid,
+                    text=f"📢 *Admin Message:*\n\n{caption_text}",
+                    parse_mode="Markdown",
+                )
             success += 1
         except TelegramError:
             failed += 1
         await asyncio.sleep(0.05)
-    await status_msg.edit_text(f"✅ *Broadcast Complete!*\n\n✔️ Sent: *{success}*\n❌ Failed: *{failed}*", parse_mode="Markdown")
 
+    await status_msg.edit_text(
+        f"✅ *Broadcast Complete!*\n\n✔️ Sent: *{success}*\n❌ Failed: *{failed}*",
+        parse_mode="Markdown"
+    )
+
+
+# ─── Admin: /ban ───────────────────────────────────────────────────────────────
 async def ban_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Sirf admin use kar sakta hai.")
@@ -511,6 +709,8 @@ async def ban_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
     await update.message.reply_text(f"✅ User `{target_id}` ban ho gaya!\n📝 Reason: {reason}", parse_mode="Markdown")
 
+
+# ─── Admin: /unban ─────────────────────────────────────────────────────────────
 async def unban_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Sirf admin use kar sakta hai.")
@@ -533,6 +733,8 @@ async def unban_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
     await update.message.reply_text(f"✅ User `{target_id}` unban ho gaya!", parse_mode="Markdown")
 
+
+# ─── Admin: /banned ────────────────────────────────────────────────────────────
 async def banned_list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Sirf admin use kar sakta hai.")
@@ -547,6 +749,8 @@ async def banned_list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• `{r['user_id']}`\n  📝 {r['reason']}\n  🕐 {r['banned_at'].strftime('%d %b %Y, %H:%M')}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+
+# ─── Admin: /approve ───────────────────────────────────────────────────────────
 async def approve_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Sirf admin use kar sakta hai.")
@@ -566,6 +770,8 @@ async def approve_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         pass
 
+
+# ─── Admin: /reject ────────────────────────────────────────────────────────────
 async def reject_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Sirf admin use kar sakta hai.")
@@ -585,6 +791,8 @@ async def reject_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         pass
 
+
+# ─── Admin: /pending ───────────────────────────────────────────────────────────
 async def pending_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Sirf admin use kar sakta hai.")
@@ -599,13 +807,18 @@ async def pending_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• `{r['user_id']}` — {r['joined_at'].strftime('%d %b, %H:%M')}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+
+# ─── Admin: /expiring ──────────────────────────────────────────────────────────
 async def expiring_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Sirf admin use kar sakta hai.")
         return
     soon = datetime.utcnow() + timedelta(days=3)
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id, expires_at FROM users WHERE is_approved = TRUE AND expires_at IS NOT NULL AND expires_at BETWEEN NOW() AND $1 ORDER BY expires_at ASC", soon)
+        rows = await conn.fetch(
+            "SELECT user_id, expires_at FROM users WHERE is_approved = TRUE AND expires_at IS NOT NULL AND expires_at BETWEEN NOW() AND $1 ORDER BY expires_at ASC",
+            soon
+        )
     if not rows:
         await update.message.reply_text("✅ Agle 3 din mein koi expire nahi ho raha.")
         return
@@ -615,14 +828,18 @@ async def expiring_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• `{r['user_id']}` — {r['expires_at'].strftime('%d %b %Y')} (*{delta.days}d baaki*)")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+
+# ─── Main ──────────────────────────────────────────────────────────────────────
 def main():
     async def post_init(app: Application):
         await init_db()
+        await set_bot_commands(app.bot)
         asyncio.create_task(expiry_checker(app.bot))
         logger.info("⏰ Expiry checker started")
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start",     start))
+    app.add_handler(CommandHandler("status",    status_cmd))
     app.add_handler(CommandHandler("stats",     stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("ban",       ban_cmd))
