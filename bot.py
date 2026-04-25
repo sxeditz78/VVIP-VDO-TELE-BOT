@@ -28,6 +28,9 @@ AUTO_DELETE_SECONDS = 600
 REPEAT_CHANCE       = 0.02   # 2% repeat chance
 APPROVAL_DAYS       = 28
 
+# Runtime toggle — admin can flip with /support on|off
+support_button_enabled: bool = True
+
 BUY_PREMIUM_MSG = (
     "💎 *Aapki Premium Access Expire Ho Gayi!*\n\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
@@ -126,6 +129,7 @@ async def set_bot_commands(bot: Bot):
         BotCommand("banned",    "📋 Banned users list"),
         BotCommand("expiring",  "⚠️ Expiring users (3 din mein)"),
         BotCommand("broadcast", "📢 Sabko message bhejo"),
+        BotCommand("support",   "🆘 Support button on/off karo"),
     ]
     await bot.set_my_commands(user_commands, scope=BotCommandScopeAllPrivateChats())
     await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
@@ -275,11 +279,6 @@ def ban_request_keyboard(user_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🚫 Keep Banned",            callback_data=f"keepban_{user_id}"),
     ]])
 
-async def get_stats() -> dict:
-    async with pool.acquire() as conn:
-        total = await conn.fetchval("SELECT COUNT(*) FROM users")
-    return {"total": total or 0}
-
 async def update_last_seen(user_id: int):
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -337,23 +336,51 @@ async def get_prev_media(user_id: int, current_media_id: int) -> dict | None:
         """, user_id, current_media_id)
     return dict(row) if row else None
 
-def media_keyboard(stats: dict) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def media_keyboard() -> InlineKeyboardMarkup:
+    rows = [
         [
             InlineKeyboardButton("⬅️ Previous", callback_data="prev"),
             InlineKeyboardButton("▶️ Next",     callback_data="next"),
         ],
-        [
-            InlineKeyboardButton(f"👥 Total Joined: {stats['total']}", callback_data="noop"),
-        ],
-        [
+    ]
+    if support_button_enabled:
+        rows.append([
             InlineKeyboardButton("🆘 Support", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}"),
-        ],
-    ])
+        ])
+    return InlineKeyboardMarkup(rows)
 
-async def send_media_to_user(bot: Bot, chat_id: int, media: dict, stats: dict, old_msg_id: int | None = None) -> int | None:
-    keyboard = media_keyboard(stats)
+async def send_media_to_user(
+    bot: Bot,
+    chat_id: int,
+    media: dict,
+    old_msg_id: int | None = None,
+    is_prev: bool = False,
+) -> int | None:
+    keyboard = media_keyboard()
     try:
+        # For prev: try to EDIT the existing message in-place (no delete flash)
+        # For next: delete old, send new (same as before)
+        if is_prev and old_msg_id:
+            try:
+                msg = await bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=SOURCE_CHAT_ID,
+                    message_id=media["message_id"],
+                    caption="⏱️ 10 min mein delete ho jayega",
+                    reply_markup=keyboard,
+                )
+                # Delete old only after new is sent — smoother replace
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
+                except TelegramError:
+                    pass
+                asyncio.create_task(auto_delete(bot, chat_id, msg.message_id, AUTO_DELETE_SECONDS))
+                return msg.message_id
+            except TelegramError as e:
+                logger.error(f"send_media prev error: {e}")
+                return None
+
+        # Next flow: delete first, then send
         if old_msg_id:
             try:
                 await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
@@ -440,7 +467,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT expires_at FROM users WHERE user_id = $1", user_id)
-    stats      = await get_stats()
     pos        = await get_position(user_id)
     expires_at = row["expires_at"] if row else None
     days_left  = None
@@ -451,16 +477,16 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     expiry_line  = f"📅 Expiry: *{exp_date_str}* ({days_left} din baaki)\n" if days_left is not None else ""
 
     if pos:
-        welcome = f"👋 *Wapas aaye!*\n\n👥 Total Joined: *{stats['total']}*\n{expiry_line}\nWohi se shuru kar rahe hain jahan chhoda tha ⬇️"
+        welcome = f"👋 *Wapas aaye!*\n\n{expiry_line}\nWohi se shuru kar rahe hain jahan chhoda tha ⬇️"
     else:
-        welcome = f"🎉 *Welcome!*\n\n👥 Total Joined: *{stats['total']}*\n{expiry_line}\n▶️ Next dabao aur enjoy karo!"
+        welcome = f"🎉 *Welcome!*\n\n{expiry_line}\n▶️ Next dabao aur enjoy karo!"
     await update.message.reply_text(welcome, parse_mode="Markdown")
 
     if pos and pos.get("current_media_id"):
         async with pool.acquire() as conn:
             media = await conn.fetchrow("SELECT id, message_id, media_type FROM media WHERE id = $1", pos["current_media_id"])
         if media:
-            new_msg_id = await send_media_to_user(ctx.bot, user_id, dict(media), stats, old_msg_id=pos.get("bot_message_id"))
+            new_msg_id = await send_media_to_user(ctx.bot, user_id, dict(media), old_msg_id=pos.get("bot_message_id"))
             if new_msg_id:
                 await save_position(user_id, media["id"], new_msg_id)
             return
@@ -469,7 +495,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not media:
         await update.message.reply_text("⚠️ Abhi koi media available nahi hai.")
         return
-    new_msg_id = await send_media_to_user(ctx.bot, user_id, media, stats)
+    new_msg_id = await send_media_to_user(ctx.bot, user_id, media)
     if new_msg_id:
         await mark_seen(user_id, media["id"])
         await save_position(user_id, media["id"], new_msg_id)
@@ -550,9 +576,9 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await update_last_seen(user_id)
-    stats            = await get_stats()
     pos              = await get_position(user_id)
     current_media_id = pos["current_media_id"] if pos else None
+    is_prev          = False
 
     if data == "next":
         media = await get_next_media(user_id)
@@ -568,12 +594,13 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not prev:
             await query.answer("⚠️ Ye pehli media hai!", show_alert=True)
             return
-        media = {"id": prev["media_id"], "message_id": prev["message_id"], "media_type": prev["media_type"]}
+        media   = {"id": prev["media_id"], "message_id": prev["message_id"], "media_type": prev["media_type"]}
+        is_prev = True
     else:
         return
 
     old_msg_id = pos["bot_message_id"] if pos else None
-    new_msg_id = await send_media_to_user(ctx.bot, user_id, media, stats, old_msg_id=old_msg_id)
+    new_msg_id = await send_media_to_user(ctx.bot, user_id, media, old_msg_id=old_msg_id, is_prev=is_prev)
     if new_msg_id:
         await save_position(user_id, media["id"], new_msg_id)
 
@@ -829,6 +856,28 @@ async def expiring_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+# ─── Admin: /support ───────────────────────────────────────────────────────────
+async def support_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global support_button_enabled
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Sirf admin use kar sakta hai.")
+        return
+    arg = ctx.args[0].lower() if ctx.args else None
+    if arg == "on":
+        support_button_enabled = True
+        await update.message.reply_text("✅ Support button *ON* kar diya gaya.", parse_mode="Markdown")
+    elif arg == "off":
+        support_button_enabled = False
+        await update.message.reply_text("🚫 Support button *OFF* kar diya gaya.", parse_mode="Markdown")
+    else:
+        status = "ON ✅" if support_button_enabled else "OFF 🚫"
+        await update.message.reply_text(
+            f"🆘 *Support Button Status: {status}*\n\n"
+            f"Toggle karne ke liye:\n`/support on` ya `/support off`",
+            parse_mode="Markdown"
+        )
+
+
 # ─── Main ──────────────────────────────────────────────────────────────────────
 def main():
     async def post_init(app: Application):
@@ -849,6 +898,7 @@ def main():
     app.add_handler(CommandHandler("reject",    reject_cmd))
     app.add_handler(CommandHandler("pending",   pending_cmd))
     app.add_handler(CommandHandler("expiring",  expiring_cmd))
+    app.add_handler(CommandHandler("support",   support_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.Chat(SOURCE_CHAT_ID) & (filters.VIDEO | filters.PHOTO), watcher))
     logger.info("🤖 Bot polling...")
