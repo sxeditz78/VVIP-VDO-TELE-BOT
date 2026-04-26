@@ -42,8 +42,14 @@ BUY_PREMIUM_MSG = (
     "✨ _Premium members ko unlimited access milta hai!_"
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Keep strong references to background tasks so GC doesn't destroy them
+_background_tasks: set = set()
+
+def _fire_and_forget(coro):
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 pool: asyncpg.Pool = None
 
@@ -376,52 +382,38 @@ async def send_media_to_user(
     media: dict,
     old_msg_id: int | None = None,
     is_prev: bool = False,
-    user_id: int | None = None,   # needed for retry fallback on next
+    user_id: int | None = None,
     _retries: int = 0,
 ) -> int | None:
     MAX_RETRIES = 10
-    keyboard = media_keyboard()
-
-    # ── Try to send the requested media ────────────────────────────────────────
     try:
-        if is_prev and old_msg_id:
-            # Send first, then delete old → smooth replace, no flash
-            msg = await _copy_media(bot, chat_id, media)
+        # Send new message FIRST for both prev & next — then delete old.
+        # This way user never sees a blank/flash between messages.
+        msg = await _copy_media(bot, chat_id, media)
+        if old_msg_id:
             try:
                 await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
             except TelegramError:
                 pass
-        else:
-            # Next / start flow: delete old first
-            if old_msg_id:
-                try:
-                    await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
-                except TelegramError:
-                    pass
-            msg = await _copy_media(bot, chat_id, media)
-
-        asyncio.create_task(auto_delete(bot, chat_id, msg.message_id, AUTO_DELETE_SECONDS))
+        _fire_and_forget(auto_delete(bot, chat_id, msg.message_id, AUTO_DELETE_SECONDS))
         return msg.message_id
 
     except TelegramError as e:
         err = str(e).lower()
         if "message to copy not found" in err or "message not found" in err:
-            # Source message deleted — clean DB and retry with a fresh media
             await delete_missing_media(media["id"])
             if _retries >= MAX_RETRIES or user_id is None:
                 logger.error(f"❌ Max retries reached or no user_id for chat {chat_id}")
                 return None
-            # Get next available media and retry
             next_media = await get_next_media(user_id)
             if not next_media:
-                logger.warning(f"⚠️ No media left after removing missing entry for chat {chat_id}")
+                logger.warning(f"⚠️ No media left for chat {chat_id}")
                 return None
             logger.info(f"🔄 Retry {_retries + 1}/{MAX_RETRIES} with media id={next_media['id']}")
             await mark_seen(user_id, next_media["id"])
             return await send_media_to_user(
                 bot, chat_id, next_media,
-                old_msg_id=None,   # already handled above
-                is_prev=False,
+                old_msg_id=old_msg_id,
                 user_id=user_id,
                 _retries=_retries + 1,
             )
@@ -429,10 +421,10 @@ async def send_media_to_user(
         return None
 
 async def auto_delete(bot: Bot, chat_id: int, message_id: int, delay: int):
-    await asyncio.sleep(delay)
     try:
+        await asyncio.sleep(delay)
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except TelegramError:
+    except (TelegramError, asyncio.CancelledError):
         pass
 
 
@@ -682,27 +674,55 @@ async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─── Admin: /broadcast ─────────────────────────────────────────────────────────
 async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    Text only:    /broadcast Your message here
-    Image+caption: Reply to a photo → /broadcast Your caption (links work)
+    3 ways to broadcast:
+      1. Reply to ANY message (text/photo/video) → /broadcast   (forwards it as-is, exact format)
+      2. /broadcast Your plain text message here
+      3. Reply to a photo → /broadcast caption text (sends photo with your caption)
     """
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Sirf admin use kar sakta hai.")
         return
 
-    caption_text = " ".join(ctx.args) if ctx.args else None
-    replied_msg  = update.message.reply_to_message
-    photo_file_id = None
+    replied_msg   = update.message.reply_to_message
+    caption_text  = " ".join(ctx.args) if ctx.args else None
 
-    if replied_msg and replied_msg.photo:
+    # Mode 1: Reply to a message with just /broadcast (no args) → forward as-is
+    if replied_msg and not caption_text:
+        users = await get_all_active_users()
+        if not users:
+            await update.message.reply_text("⚠️ Koi active user nahi hai.")
+            return
+        status_msg = await update.message.reply_text(f"📤 Broadcasting to *{len(users)}* users...", parse_mode="Markdown")
+        success, failed = 0, 0
+        for uid in users:
+            try:
+                await ctx.bot.forward_message(
+                    chat_id=uid,
+                    from_chat_id=update.effective_chat.id,
+                    message_id=replied_msg.message_id,
+                )
+                success += 1
+            except TelegramError:
+                failed += 1
+            await asyncio.sleep(0.05)
+        await status_msg.edit_text(
+            f"✅ *Broadcast Complete!*\n\n✔️ Sent: *{success}*\n❌ Failed: *{failed}*",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Mode 2: Reply to photo + /broadcast caption → send photo with exact caption
+    photo_file_id = None
+    if replied_msg and replied_msg.photo and caption_text:
         photo_file_id = replied_msg.photo[-1].file_id
-        if not caption_text:
-            caption_text = replied_msg.caption or ""
-    elif not caption_text:
+
+    # Mode 3: /broadcast plain text (no reply)
+    if not photo_file_id and not caption_text:
         await update.message.reply_text(
             "ℹ️ *Broadcast Usage:*\n\n"
-            "📝 *Text only:*\n`/broadcast Aapka message yahan`\n\n"
-            "🖼️ *Image + Caption:*\nEk photo forward karo is chat mein, usse reply karo:\n`/broadcast Aapka caption yahan`\n\n"
-            "🔗 Links caption mein directly likho.",
+            "1️⃣ *Forward exact message:*\nKoi bhi message reply karo → `/broadcast`\n\n"
+            "2️⃣ *Plain text:*\n`/broadcast Aapka message`\n\n"
+            "3️⃣ *Photo + caption:*\nPhoto reply karo → `/broadcast caption text`",
             parse_mode="Markdown"
         )
         return
@@ -718,17 +738,17 @@ async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for uid in users:
         try:
             if photo_file_id:
+                # Send photo with admin's caption exactly as typed
                 await ctx.bot.send_photo(
                     chat_id=uid,
                     photo=photo_file_id,
-                    caption=f"📢 *Admin Message:*\n\n{caption_text}" if caption_text else "📢 *Admin Message*",
-                    parse_mode="Markdown",
+                    caption=caption_text,
                 )
             else:
+                # Send text exactly as admin typed — no parse_mode so formatting is literal
                 await ctx.bot.send_message(
                     chat_id=uid,
-                    text=f"📢 *Admin Message:*\n\n{caption_text}",
-                    parse_mode="Markdown",
+                    text=caption_text,
                 )
             success += 1
         except TelegramError:
@@ -912,10 +932,20 @@ def main():
     async def post_init(app: Application):
         await init_db()
         await set_bot_commands(app.bot)
-        asyncio.create_task(expiry_checker(app.bot))
+        # Store task on app so it's tracked and cancelled cleanly on shutdown
+        app.bot_data["expiry_task"] = asyncio.create_task(expiry_checker(app.bot))
         logger.info("⏰ Expiry checker started")
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    async def post_shutdown(app: Application):
+        task = app.bot_data.get("expiry_task")
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("start",     start))
     app.add_handler(CommandHandler("status",    status_cmd))
     app.add_handler(CommandHandler("stats",     stats_cmd))
