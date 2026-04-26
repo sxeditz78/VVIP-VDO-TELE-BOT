@@ -42,6 +42,9 @@ BUY_PREMIUM_MSG = (
     "✨ _Premium members ko unlimited access milta hai!_"
 )
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Keep strong references to background tasks so GC doesn't destroy them
 _background_tasks: set = set()
 
