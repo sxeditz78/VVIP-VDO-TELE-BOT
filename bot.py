@@ -706,17 +706,18 @@ async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         success, failed = 0, 0
         for uid in users:
             try:
-                await ctx.bot.copy_message(
+                sent = await ctx.bot.copy_message(
                     chat_id=uid,
                     from_chat_id=update.effective_chat.id,
                     message_id=replied_msg.message_id,
                 )
+                _fire_and_forget(auto_delete(ctx.bot, uid, sent.message_id, 86400))
                 success += 1
             except TelegramError:
                 failed += 1
             await asyncio.sleep(0.05)
         await status_msg.edit_text(
-            f"✅ *Broadcast Complete!*\n\n✔️ Sent: *{success}*\n❌ Failed: *{failed}*",
+            f"✅ *Broadcast Complete!*\n\n✔️ Sent: *{success}*\n❌ Failed: *{failed}*\n🕐 24 ghante baad auto-delete ho jayega.",
             parse_mode="Markdown"
         )
         return
@@ -768,29 +769,26 @@ async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for uid in users:
         try:
             if photo_file_id:
-                await ctx.bot.send_photo(
+                sent = await ctx.bot.send_photo(
                     chat_id=uid,
                     photo=photo_file_id,
                     caption=raw,
                 )
             else:
-                await ctx.bot.send_message(
+                sent = await ctx.bot.send_message(
                     chat_id=uid,
                     text=raw,
                     entities=shifted_entities if shifted_entities else None,
                 )
+            # Auto-delete broadcast after 24 hours silently
+            _fire_and_forget(auto_delete(ctx.bot, uid, sent.message_id, 86400))
             success += 1
         except TelegramError:
             failed += 1
         await asyncio.sleep(0.05)
 
     await status_msg.edit_text(
-        f"✅ *Broadcast Complete!*\n\n✔️ Sent: *{success}*\n❌ Failed: *{failed}*",
-        parse_mode="Markdown"
-    )
-
-    await status_msg.edit_text(
-        f"✅ *Broadcast Complete!*\n\n✔️ Sent: *{success}*\n❌ Failed: *{failed}*",
+        f"✅ *Broadcast Complete!*\n\n✔️ Sent: *{success}*\n❌ Failed: *{failed}*\n🕐 24 ghante baad auto-delete ho jayega.",
         parse_mode="Markdown"
     )
 
