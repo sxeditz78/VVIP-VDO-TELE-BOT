@@ -678,28 +678,35 @@ async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     3 ways to broadcast:
-      1. Reply to ANY message (text/photo/video) → /broadcast   (forwards it as-is, exact format)
-      2. /broadcast Your plain text message here
-      3. Reply to a photo → /broadcast caption text (sends photo with your caption)
+      1. Reply to ANY message → /broadcast        (copies it exactly, no forward label)
+      2. /broadcast text (multiline ok)           (sends raw text as-is)
+      3. Reply to photo → /broadcast caption      (photo + your caption)
     """
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Sirf admin use kar sakta hai.")
         return
 
-    replied_msg   = update.message.reply_to_message
-    caption_text  = " ".join(ctx.args) if ctx.args else None
+    msg         = update.message
+    replied_msg = msg.reply_to_message
 
-    # Mode 1: Reply to a message with just /broadcast (no args) → forward as-is
-    if replied_msg and not caption_text:
+    # Extract raw text after "/broadcast" — preserves newlines, spaces, emojis
+    raw = msg.text or ""
+    # Strip the command part (/broadcast or /broadcast@botname)
+    if raw.startswith("/broadcast"):
+        raw = raw.split(None, 1)[1] if len(raw.split(None, 1)) > 1 else ""
+    raw = raw.strip()
+
+    # ── Mode 1: Reply to any message + no text → copy message exactly ──────────
+    if replied_msg and not raw:
         users = await get_all_active_users()
         if not users:
-            await update.message.reply_text("⚠️ Koi active user nahi hai.")
+            await msg.reply_text("⚠️ Koi active user nahi hai.")
             return
-        status_msg = await update.message.reply_text(f"📤 Broadcasting to *{len(users)}* users...", parse_mode="Markdown")
+        status_msg = await msg.reply_text(f"📤 Broadcasting to *{len(users)}* users...", parse_mode="Markdown")
         success, failed = 0, 0
         for uid in users:
             try:
-                await ctx.bot.forward_message(
+                await ctx.bot.copy_message(
                     chat_id=uid,
                     from_chat_id=update.effective_chat.id,
                     message_id=replied_msg.message_id,
@@ -714,49 +721,73 @@ async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Mode 2: Reply to photo + /broadcast caption → send photo with exact caption
+    # ── Mode 2: Reply to photo + text → photo with exact caption ───────────────
     photo_file_id = None
-    if replied_msg and replied_msg.photo and caption_text:
+    if replied_msg and replied_msg.photo and raw:
         photo_file_id = replied_msg.photo[-1].file_id
 
-    # Mode 3: /broadcast plain text (no reply)
-    if not photo_file_id and not caption_text:
-        await update.message.reply_text(
+    # ── Nothing provided → show help ───────────────────────────────────────────
+    if not photo_file_id and not raw:
+        await msg.reply_text(
             "ℹ️ *Broadcast Usage:*\n\n"
-            "1️⃣ *Forward exact message:*\nKoi bhi message reply karo → `/broadcast`\n\n"
-            "2️⃣ *Plain text:*\n`/broadcast Aapka message`\n\n"
-            "3️⃣ *Photo + caption:*\nPhoto reply karo → `/broadcast caption text`",
+            "1️⃣ *Exact copy:*\nKoi bhi message reply karo → `/broadcast`\n\n"
+            "2️⃣ *Text:*\n`/broadcast Aapka message` _(multiline bhi kaam karta hai)_\n\n"
+            "3️⃣ *Photo + caption:*\nPhoto reply karo → `/broadcast caption`",
             parse_mode="Markdown"
         )
         return
 
     users = await get_all_active_users()
     if not users:
-        await update.message.reply_text("⚠️ Koi active user nahi hai.")
+        await msg.reply_text("⚠️ Koi active user nahi hai.")
         return
 
-    status_msg = await update.message.reply_text(f"📤 Broadcasting to *{len(users)}* users...", parse_mode="Markdown")
+    status_msg = await msg.reply_text(f"📤 Broadcasting to *{len(users)}* users...", parse_mode="Markdown")
     success, failed = 0, 0
+
+    # Preserve entities (bold/italic/links) from admin's message for text broadcasts
+    entities = msg.entities or []
+    # Shift entity offsets — remove the "/broadcast " prefix length
+    prefix_len = len((msg.text or "").split(None, 1)[0]) + 1  # "/broadcast "
+    shifted_entities = []
+    for ent in entities:
+        new_offset = ent.offset - prefix_len
+        if new_offset >= 0:
+            shifted_entities.append(
+                ent.__class__(
+                    type=ent.type,
+                    offset=new_offset,
+                    length=ent.length,
+                    url=getattr(ent, "url", None),
+                    user=getattr(ent, "user", None),
+                    language=getattr(ent, "language", None),
+                    custom_emoji_id=getattr(ent, "custom_emoji_id", None),
+                )
+            )
 
     for uid in users:
         try:
             if photo_file_id:
-                # Send photo with admin's caption exactly as typed
                 await ctx.bot.send_photo(
                     chat_id=uid,
                     photo=photo_file_id,
-                    caption=caption_text,
+                    caption=raw,
                 )
             else:
-                # Send text exactly as admin typed — no parse_mode so formatting is literal
                 await ctx.bot.send_message(
                     chat_id=uid,
-                    text=caption_text,
+                    text=raw,
+                    entities=shifted_entities if shifted_entities else None,
                 )
             success += 1
         except TelegramError:
             failed += 1
         await asyncio.sleep(0.05)
+
+    await status_msg.edit_text(
+        f"✅ *Broadcast Complete!*\n\n✔️ Sent: *{success}*\n❌ Failed: *{failed}*",
+        parse_mode="Markdown"
+    )
 
     await status_msg.edit_text(
         f"✅ *Broadcast Complete!*\n\n✔️ Sent: *{success}*\n❌ Failed: *{failed}*",
