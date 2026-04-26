@@ -320,7 +320,11 @@ async def get_next_media(user_id: int) -> dict | None:
 
 async def mark_seen(user_id: int, media_id: int):
     async with pool.acquire() as conn:
-        await conn.execute("INSERT INTO user_history (user_id, media_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", user_id, media_id)
+        await conn.execute("""
+            INSERT INTO user_history (user_id, media_id, seen_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (user_id, media_id) DO UPDATE SET seen_at = NOW()
+        """, user_id, media_id)
 
 async def get_position(user_id: int) -> dict | None:
     async with pool.acquire() as conn:
@@ -336,13 +340,23 @@ async def save_position(user_id: int, media_id: int, bot_msg_id: int):
         """, user_id, media_id, bot_msg_id)
 
 async def get_prev_media(user_id: int, current_media_id: int) -> dict | None:
+    """Return the media the user saw just before current, based on actual view time."""
     async with pool.acquire() as conn:
+        # Get seen_at of the current media so we can find what came before it
+        current_row = await conn.fetchrow(
+            "SELECT seen_at FROM user_history WHERE user_id = $1 AND media_id = $2",
+            user_id, current_media_id
+        )
+        if not current_row:
+            return None
         row = await conn.fetchrow("""
             SELECT uh.media_id, m.message_id, m.media_type
             FROM user_history uh JOIN media m ON m.id = uh.media_id
-            WHERE uh.user_id = $1 AND uh.media_id < $2
-            ORDER BY uh.media_id DESC LIMIT 1
-        """, user_id, current_media_id)
+            WHERE uh.user_id = $1
+              AND uh.media_id != $2
+              AND uh.seen_at <= $3
+            ORDER BY uh.seen_at DESC LIMIT 1
+        """, user_id, current_media_id, current_row["seen_at"])
     return dict(row) if row else None
 
 def media_keyboard() -> InlineKeyboardMarkup:
@@ -384,7 +398,7 @@ async def send_media_to_user(
     chat_id: int,
     media: dict,
     old_msg_id: int | None = None,
-    is_prev: bool = False,
+    is_prev: bool = False,  # kept for API compat, unused internally
     user_id: int | None = None,
     _retries: int = 0,
 ) -> int | None:
@@ -512,6 +526,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if media:
             new_msg_id = await send_media_to_user(ctx.bot, user_id, dict(media), old_msg_id=pos.get("bot_message_id"), user_id=user_id)
             if new_msg_id:
+                await mark_seen(user_id, media["id"])
                 await save_position(user_id, media["id"], new_msg_id)
             return
 
@@ -602,12 +617,11 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update_last_seen(user_id)
     pos              = await get_position(user_id)
     current_media_id = pos["current_media_id"] if pos else None
-    is_prev          = False
 
     if data == "next":
         media = await get_next_media(user_id)
         if not media:
-            await query.message.reply_text("⚠️ Koi nai media nahi hai abhi.")
+            await query.answer("⚠️ Koi nai media nahi hai abhi!", show_alert=True)
             return
         await mark_seen(user_id, media["id"])
     elif data == "prev":
@@ -618,13 +632,13 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not prev:
             await query.answer("⚠️ Ye pehli media hai!", show_alert=True)
             return
-        media   = {"id": prev["media_id"], "message_id": prev["message_id"], "media_type": prev["media_type"]}
-        is_prev = True
+        media = {"id": prev["media_id"], "message_id": prev["message_id"], "media_type": prev["media_type"]}
+        # Don't update seen_at for prev — we want history order preserved for navigation
     else:
         return
 
     old_msg_id = pos["bot_message_id"] if pos else None
-    new_msg_id = await send_media_to_user(ctx.bot, user_id, media, old_msg_id=old_msg_id, is_prev=is_prev, user_id=user_id)
+    new_msg_id = await send_media_to_user(ctx.bot, user_id, media, old_msg_id=old_msg_id, user_id=user_id)
     if new_msg_id:
         await save_position(user_id, media["id"], new_msg_id)
 
@@ -965,7 +979,7 @@ def main():
         await init_db()
         await set_bot_commands(app.bot)
         # Store task on app so it's tracked and cancelled cleanly on shutdown
-        app.bot_data["expiry_task"] = asyncio.create_task(expiry_checker(app.bot))
+        app.bot_data["expiry_task"] = _fire_and_forget(expiry_checker(app.bot))
         logger.info("⏰ Expiry checker started")
 
     async def post_shutdown(app: Application):
