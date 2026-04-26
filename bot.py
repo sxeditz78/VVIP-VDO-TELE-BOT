@@ -22,7 +22,7 @@ DATABASE_URL     = os.environ["DATABASE_URL"]
 SOURCE_CHAT_ID   = int(os.environ["SOURCE_CHAT_ID"])
 ADMIN_ID         = int(os.environ["ADMIN_ID"])
 ADMIN_USERNAME   = os.environ.get("ADMIN_USERNAME", "@SynaX_69")
-SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "@SynaX_69")   # support button username
+SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "@Olly_077")   # support button username
 
 AUTO_DELETE_SECONDS = 600
 REPEAT_CHANCE       = 0.02   # 2% repeat chance
